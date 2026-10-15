@@ -6,6 +6,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:crypto/crypto.dart';
@@ -972,8 +973,7 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
             ),
             actions: [
               TextButton(
-                onPressed: () =>
-                    Navigator.of(dialogContext, rootNavigator: true).pop(),
+                onPressed: () => Navigator.of(dialogContext).pop(),
                 child: const Text('Cancelar'),
               ),
               FilledButton(
@@ -1510,6 +1510,8 @@ class Proyecto {
 
 enum EstadoRecorrido { detenido, activo, pausado, finalizado }
 
+enum TipoRecorrido { estimativo, visitaTecnica }
+
 class Recorrido {
   const Recorrido({
     required this.id,
@@ -1517,7 +1519,9 @@ class Recorrido {
     required this.nombre,
     required this.estado,
     required this.inicio,
+    this.tipo = TipoRecorrido.estimativo,
     this.fin,
+    this.recomendacionFinal,
   });
 
   final int id;
@@ -1525,7 +1529,9 @@ class Recorrido {
   final String nombre;
   final EstadoRecorrido estado;
   final DateTime inicio;
+  final TipoRecorrido tipo;
   final DateTime? fin;
+  final String? recomendacionFinal;
 }
 
 class PuntosDatabase {
@@ -1539,7 +1545,7 @@ class PuntosDatabase {
     final databasePath = path.join(databasesPath, 'coordenadas.db');
     _database = await openDatabase(
       databasePath,
-      version: 13,
+      version: 14,
       onCreate: (database, version) async {
         await database.execute('''
           CREATE TABLE puntos (
@@ -1607,6 +1613,17 @@ class PuntosDatabase {
         if (oldVersion < 13) {
           await database.execute(
             'ALTER TABLE puntos ADD COLUMN cantidad_palmas INTEGER',
+          );
+        }
+        if (oldVersion < 14) {
+          await database.execute(
+            "ALTER TABLE recorridos ADD COLUMN tipo TEXT NOT NULL DEFAULT 'estimativo'",
+          );
+          await database.execute(
+            'ALTER TABLE recorridos ADD COLUMN recomendacion_final TEXT',
+          );
+          await database.execute(
+            'ALTER TABLE recorrido_puntos ADD COLUMN datos_visita TEXT',
           );
         }
       },
@@ -1825,7 +1842,9 @@ class PuntosDatabase {
       nombre TEXT NOT NULL,
       estado TEXT NOT NULL,
       inicio TEXT NOT NULL,
-      fin TEXT
+      fin TEXT,
+      tipo TEXT NOT NULL DEFAULT 'estimativo',
+      recomendacion_final TEXT
     )
   ''');
     await database.execute('''
@@ -1842,6 +1861,7 @@ class PuntosDatabase {
       inflorescencias INTEGER,
       foto_path TEXT,
       numero_registro INTEGER,
+      datos_visita TEXT,
       FOREIGN KEY (recorrido_id) REFERENCES recorridos (id) ON DELETE CASCADE
     )
   ''');
@@ -1892,6 +1912,7 @@ class PuntosDatabase {
   static Future<int> crearRecorrido({
     required int proyectoId,
     required String nombre,
+    required TipoRecorrido tipo,
   }) async {
     final database = await PuntosDatabase.database;
     return database.insert('recorridos', {
@@ -1899,7 +1920,21 @@ class PuntosDatabase {
       'nombre': nombre,
       'estado': 'activo',
       'inicio': DateTime.now().toIso8601String(),
+      'tipo': tipo.name,
     });
+  }
+
+  static Future<void> guardarRecomendacionFinal(
+    int id,
+    String recomendacion,
+  ) async {
+    final database = await PuntosDatabase.database;
+    await database.update(
+      'recorridos',
+      {'recomendacion_final': recomendacion},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   static Future<void> actualizarEstadoRecorrido(
@@ -1971,6 +2006,7 @@ class PuntosDatabase {
     int? racimosPintones,
     int? inflorescencias,
     String? fotoPath,
+    String? datosVisita,
   }) async {
     final database = await PuntosDatabase.database;
     final ultimoRegistro = await database.rawQuery(
@@ -1991,6 +2027,7 @@ class PuntosDatabase {
       'inflorescencias': inflorescencias,
       'foto_path': fotoPath,
       'numero_registro': numeroRegistro,
+      'datos_visita': datosVisita,
     });
   }
 
@@ -2055,9 +2092,14 @@ class PuntosDatabase {
               orElse: () => EstadoRecorrido.finalizado,
             ),
             inicio: DateTime.parse(fila['inicio']! as String),
+            tipo: TipoRecorrido.values.firstWhere(
+              (item) => item.name == fila['tipo'],
+              orElse: () => TipoRecorrido.estimativo,
+            ),
             fin: fila['fin'] == null
                 ? null
                 : DateTime.parse(fila['fin']! as String),
+            recomendacionFinal: fila['recomendacion_final'] as String?,
           ),
         )
         .toList();
@@ -2274,6 +2316,8 @@ class TransferenciaPlantacion {
             'estado': estadoImportado,
             'inicio': grupo.datos['inicio'],
             'fin': grupo.datos['fin'],
+            'tipo': grupo.datos['tipo'] ?? TipoRecorrido.estimativo.name,
+            'recomendacion_final': grupo.datos['recomendacion_final'],
           });
           for (final punto in grupo.puntos) {
             await transaction.insert('recorrido_puntos', {
@@ -2288,6 +2332,7 @@ class TransferenciaPlantacion {
               'inflorescencias': punto.datos['inflorescencias'],
               'foto_path': punto.fotoPath,
               'numero_registro': punto.datos['numero_registro'],
+              'datos_visita': punto.datos['datos_visita'],
             });
           }
         }
@@ -2342,6 +2387,81 @@ class TransferenciaPlantacion {
   }
 }
 
+Map<String, Object?>? _decodificarDatosVisita(Object? value) {
+  if (value == null) return null;
+  if (value is! String) {
+    throw const FormatException(
+      'Los datos de una visita técnica no son válidos.',
+    );
+  }
+  final decoded = jsonDecode(value);
+  if (decoded is! Map) {
+    throw const FormatException(
+      'Los datos de una visita técnica no son válidos.',
+    );
+  }
+  return Map<String, Object?>.from(decoded);
+}
+
+Map<String, Object?> _datosVisitaParaMarcador(Object? value) {
+  if (value == null) return const {};
+
+  Object? decoded = value;
+  if (value is String) {
+    try {
+      decoded = jsonDecode(value);
+    } on FormatException catch (error, stackTrace) {
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: error,
+          stack: stackTrace,
+          library: 'Recorridos map markers',
+          context: ErrorDescription(
+            'while decoding technical-visit data for a map marker',
+          ),
+        ),
+      );
+      return const {};
+    }
+  }
+
+  if (decoded is Map) {
+    final result = <String, Object?>{};
+    for (final entry in decoded.entries) {
+      if (entry.key is! String) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: const FormatException(
+              'Los datos de visita contienen una clave que no es texto.',
+            ),
+            library: 'Recorridos map markers',
+          ),
+        );
+        return const {};
+      }
+      result[entry.key as String] = entry.value;
+    }
+    return result;
+  }
+
+  FlutterError.reportError(
+    FlutterErrorDetails(
+      exception: const FormatException(
+        'Los datos de visita no tienen un formato compatible.',
+      ),
+      library: 'Recorridos map markers',
+    ),
+  );
+  return const {};
+}
+
+bool _enfermedadPresente(Map<String, Object?> datos, String nombre) {
+  final seleccionadas = datos['enfermedades_presentes'];
+  if (seleccionadas is List) return seleccionadas.contains(nombre);
+  final cantidad = datos[nombre];
+  return cantidad is num && cantidad > 0;
+}
+
 class ExportadorDatos {
   static Future<void> compartirRecorridoExcel(int recorridoId) async {
     final database = await PuntosDatabase.database;
@@ -2364,6 +2484,35 @@ class ExportadorDatos {
       orderBy: 'numero_registro, fecha',
     );
     final libro = Excel.createExcel();
+    final resumen = libro['Resumen'];
+    resumen.appendRow([
+      TextCellValue('Plantación'),
+      TextCellValue('${plantacion['nombre']}'),
+    ]);
+    resumen.appendRow([
+      TextCellValue('Recorrido'),
+      TextCellValue('${recorrido['nombre']}'),
+    ]);
+    resumen.appendRow([
+      TextCellValue('Tipo'),
+      TextCellValue(
+        recorrido['tipo'] == TipoRecorrido.visitaTecnica.name
+            ? 'Visita técnica'
+            : 'Estimativo',
+      ),
+    ]);
+    resumen.appendRow([
+      TextCellValue('Inicio'),
+      TextCellValue('${recorrido['inicio']}'),
+    ]);
+    resumen.appendRow([
+      TextCellValue('Finalización'),
+      TextCellValue('${recorrido['fin'] ?? ''}'),
+    ]);
+    resumen.appendRow([
+      TextCellValue('Recomendación final'),
+      TextCellValue('${recorrido['recomendacion_final'] ?? ''}'),
+    ]);
     final hoja = libro['Recorrido'];
     hoja.appendRow([
       TextCellValue('N° registro'),
@@ -2378,8 +2527,48 @@ class ExportadorDatos {
       TextCellValue('Racimos verdes'),
       TextCellValue('Racimos pintones'),
       TextCellValue('Inflorescencias'),
+      TextCellValue('Tipo de registro'),
+      TextCellValue('MS presenta'),
+      TextCellValue('AR presenta'),
+      TextCellValue('PE presenta'),
+      TextCellValue('Lepthopharsa presenta'),
+      TextCellValue('Lepthopharsa cantidad'),
+      TextCellValue('Demotispa presenta'),
+      TextCellValue('Demotispa cantidad'),
+      TextCellValue('Cephaloleia presenta'),
+      TextCellValue('Cephaloleia cantidad'),
+      TextCellValue('Opsiphanes presenta'),
+      TextCellValue('Opsiphanes cantidad'),
+      TextCellValue('Recomendación final'),
     ]);
     for (final fila in filas) {
+      final datosVisita = _decodificarDatosVisita(fila['datos_visita']);
+      final esEnfermedades = datosVisita?['categoria'] == 'enfermedades';
+      final datosPlagas = datosVisita?['categoria'] == 'plagas'
+          ? datosVisita
+          : null;
+      CellValue? entero(Object? value) =>
+          value is num ? IntCellValue(value.toInt()) : null;
+      CellValue? presencia(String nombre) {
+        final plaga = datosPlagas?[nombre];
+        return plaga is Map && plaga['presente'] is bool
+            ? TextCellValue((plaga['presente']! as bool) ? 'Sí' : 'No')
+            : null;
+      }
+
+      CellValue? cantidad(String nombre) {
+        final plaga = datosPlagas?[nombre];
+        return plaga is Map ? entero(plaga['cantidad']) : null;
+      }
+
+      CellValue? presenciaEnfermedad(String nombre) {
+        return esEnfermedades
+            ? TextCellValue(
+                _enfermedadPresente(datosVisita!, nombre) ? 'Sí' : 'No',
+              )
+            : null;
+      }
+
       hoja.appendRow([
         IntCellValue((fila['numero_registro'] as int?) ?? 0),
         IntCellValue((fila['id'] as int?) ?? 0),
@@ -2393,6 +2582,19 @@ class ExportadorDatos {
         IntCellValue((fila['racimos_verdes'] as int?) ?? 0),
         IntCellValue((fila['racimos_pintones'] as int?) ?? 0),
         IntCellValue((fila['inflorescencias'] as int?) ?? 0),
+        TextCellValue('${datosVisita?['categoria'] ?? 'Estimativo'}'),
+        presenciaEnfermedad('MS'),
+        presenciaEnfermedad('AR'),
+        presenciaEnfermedad('PE'),
+        presencia('Lepthopharsa'),
+        cantidad('Lepthopharsa'),
+        presencia('Demotispa'),
+        cantidad('Demotispa'),
+        presencia('Cephaloleia'),
+        cantidad('Cephaloleia'),
+        presencia('Opsiphanes'),
+        cantidad('Opsiphanes'),
+        TextCellValue('${recorrido['recomendacion_final'] ?? ''}'),
       ]);
     }
     final bytes = libro.encode();
@@ -2425,30 +2627,92 @@ class ExportadorDatos {
           (fila) => '${fila['longitud']},${fila['latitud']},${fila['altitud']}',
         )
         .join(' ');
-    final registros = filas.where(
-      (fila) =>
-          fila['racimos_verdes'] != null ||
-          fila['racimos_pintones'] != null ||
-          fila['inflorescencias'] != null,
-    );
-    final marcas = registros
-        .map(
-          (fila) =>
-              '''
+    final recomendacion = recorrido['recomendacion_final'] as String?;
+    final registros = filas.where((fila) => fila['numero_registro'] != null);
+    final marcas = registros.map((fila) {
+      final datosVisita = _decodificarDatosVisita(fila['datos_visita']);
+      final detalles = <String>['Registro: ${_xml(fila['numero_registro'])}'];
+      final atributos = <String, Object?>{
+        'numero_registro': fila['numero_registro'],
+        'fecha': fila['fecha'],
+        'latitud': fila['latitud'],
+        'longitud': fila['longitud'],
+        'altitud': fila['altitud'],
+      };
+      if (datosVisita == null) {
+        detalles
+          ..add('Racimos verdes: ${_xml(fila['racimos_verdes'] ?? 0)}')
+          ..add('Racimos pintones: ${_xml(fila['racimos_pintones'] ?? 0)}')
+          ..add('Inflorescencias: ${_xml(fila['inflorescencias'] ?? 0)}');
+        atributos.addAll({
+          'racimos_verdes': fila['racimos_verdes'] ?? 0,
+          'racimos_pintones': fila['racimos_pintones'] ?? 0,
+          'inflorescencias': fila['inflorescencias'] ?? 0,
+        });
+      } else {
+        final categoria = datosVisita['categoria'];
+        detalles.add('Tipo de registro: Visita técnica');
+        atributos['tipo_registro'] = 'Visita técnica';
+        if (categoria == 'enfermedades') {
+          detalles.add('Tipo de visita: Enfermedades');
+          atributos['tipo_visita'] = 'Enfermedades';
+          for (final enfermedad in ['MS', 'AR', 'PE']) {
+            final presente = _enfermedadPresente(datosVisita, enfermedad);
+            detalles.add('$enfermedad presenta: ${presente ? 'Sí' : 'No'}');
+            atributos['${enfermedad.toLowerCase()}_presente'] = presente
+                ? 1
+                : 0;
+          }
+        } else if (categoria == 'plagas') {
+          detalles.add('Tipo de visita: Plagas');
+          atributos['tipo_visita'] = 'Plagas';
+          for (final plaga in [
+            'Lepthopharsa',
+            'Demotispa',
+            'Cephaloleia',
+            'Opsiphanes',
+          ]) {
+            final datosPlaga = datosVisita[plaga];
+            final presente =
+                datosPlaga is Map && datosPlaga['presente'] == true;
+            final cantidad = datosPlaga is Map
+                ? datosPlaga['cantidad'] ?? 0
+                : 0;
+            detalles
+              ..add('$plaga presenta: ${presente ? 'Sí' : 'No'}')
+              ..add('$plaga cantidad: ${_xml(cantidad)}');
+            atributos['${plaga.toLowerCase()}_presente'] = presente ? 1 : 0;
+            atributos['${plaga.toLowerCase()}_cantidad'] = cantidad;
+          }
+        }
+        if (recomendacion != null && recomendacion.isNotEmpty) {
+          detalles.add('Recomendación final: ${_xml(recomendacion)}');
+          atributos['recomendacion_final'] = recomendacion;
+        }
+      }
+      detalles.add('Fecha: ${_xml(fila['fecha'])}');
+      final descripcion = detalles.map((linea) => '$linea<br/>').join();
+      final datosExtendidos = atributos.entries.map((atributo) {
+        final value = atributo.value is bool
+            ? ((atributo.value! as bool) ? 1 : 0)
+            : atributo.value;
+        return '''
+        <Data name="${_xml(atributo.key)}"><value>${_xml(value)}</value></Data>
+''';
+      }).join();
+      return '''
     <Placemark>
       <name>Registro ${_xml(fila['numero_registro'])}</name>
       <description><![CDATA[
-        Registro: ${_xml(fila['numero_registro'])}<br/>
-        Racimos verdes: ${_xml(fila['racimos_verdes'] ?? 0)}<br/>
-        Racimos pintones: ${_xml(fila['racimos_pintones'] ?? 0)}<br/>
-        Inflorescencias: ${_xml(fila['inflorescencias'] ?? 0)}<br/>
-        Fecha: ${_xml(fila['fecha'])}
+        $descripcion
       ]]></description>
+      <ExtendedData>
+        $datosExtendidos
+      </ExtendedData>
       <Point><coordinates>${fila['longitud']},${fila['latitud']},${fila['altitud']}</coordinates></Point>
     </Placemark>
-  ''',
-        )
-        .join();
+  ''';
+    }).join();
     final kml =
         '''
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2468,6 +2732,161 @@ class ExportadorDatos {
       'recorrido_$recorridoId.kml',
       'application/vnd.google-earth.kml+xml',
     );
+  }
+
+  static Future<void> compartirRecorridoWord(int recorridoId) async {
+    final database = await PuntosDatabase.database;
+    final recorrido = (await database.query(
+      'recorridos',
+      where: 'id = ?',
+      whereArgs: [recorridoId],
+      limit: 1,
+    )).first;
+    final plantacion = (await database.query(
+      'proyectos',
+      where: 'id = ?',
+      whereArgs: [recorrido['proyecto_id']],
+      limit: 1,
+    )).first;
+    final filas = await database.query(
+      'recorrido_puntos',
+      where: 'recorrido_id = ? AND numero_registro IS NOT NULL',
+      whereArgs: [recorridoId],
+      orderBy: 'numero_registro, fecha',
+    );
+    final rtf = StringBuffer(
+      r'{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs22 ',
+    );
+    void parrafo(String texto, {bool negrita = false}) {
+      rtf
+        ..write(negrita ? r'\b ' : '')
+        ..write(_escaparRtf(texto))
+        ..write(negrita ? r'\b0' : '')
+        ..write(r'\par ');
+    }
+
+    parrafo('Informe de visita técnica', negrita: true);
+    parrafo('Plantación: ${plantacion['nombre']}');
+    parrafo('Recorrido: ${recorrido['nombre']}');
+    parrafo('Inicio: ${recorrido['inicio']}');
+    if (recorrido['fin'] != null) parrafo('Finalización: ${recorrido['fin']}');
+    parrafo('');
+    for (final fila in filas) {
+      final datosVisita = _decodificarDatosVisita(fila['datos_visita']);
+      parrafo('Registro ${fila['numero_registro']}', negrita: true);
+      parrafo('Fecha: ${fila['fecha']}');
+      parrafo('Latitud: ${fila['latitud']}');
+      parrafo('Longitud: ${fila['longitud']}');
+      parrafo('Altitud: ${fila['altitud']} m');
+      if (datosVisita != null && datosVisita['categoria'] == 'enfermedades') {
+        parrafo('Enfermedades', negrita: true);
+        for (final enfermedad in ['MS', 'AR', 'PE']) {
+          final presente = _enfermedadPresente(datosVisita, enfermedad);
+          parrafo('$enfermedad: ${presente ? 'Sí presenta' : 'No presenta'}');
+        }
+      } else if (datosVisita != null && datosVisita['categoria'] == 'plagas') {
+        parrafo('Plagas', negrita: true);
+        for (final plaga in [
+          'Lepthopharsa',
+          'Demotispa',
+          'Cephaloleia',
+          'Opsiphanes',
+        ]) {
+          final valores = datosVisita[plaga];
+          if (valores is Map) {
+            final presente = valores['presente'] == true;
+            parrafo(
+              '$plaga: ${presente ? 'Sí, cantidad ${valores['cantidad'] ?? 0}' : 'No presenta'}',
+            );
+          }
+        }
+      } else {
+        parrafo('Racimos verdes: ${fila['racimos_verdes'] ?? 0}');
+        parrafo('Racimos pintones: ${fila['racimos_pintones'] ?? 0}');
+        parrafo('Inflorescencias: ${fila['inflorescencias'] ?? 0}');
+      }
+      final fotoPath = fila['foto_path'] as String?;
+      if (fotoPath != null) {
+        parrafo('Evidencia fotográfica', negrita: true);
+        rtf.write(await _imagenRtf(fotoPath));
+        rtf.write(r'\par ');
+      }
+      parrafo('');
+    }
+    final recomendacion = recorrido['recomendacion_final'] as String?;
+    if (recomendacion != null && recomendacion.isNotEmpty) {
+      parrafo('Recomendación final', negrita: true);
+      parrafo(recomendacion);
+    }
+    rtf.write('}');
+    await _compartir(
+      Uint8List.fromList(utf8.encode(rtf.toString())),
+      'visita_tecnica_$recorridoId.rtf',
+      'application/rtf',
+    );
+  }
+
+  static Future<String> _imagenRtf(String fotoPath) async {
+    final archivo = File(fotoPath);
+    if (!await archivo.exists()) {
+      throw FileSystemException(
+        'No se encontró una evidencia guardada',
+        fotoPath,
+      );
+    }
+    final bytes = await archivo.readAsBytes();
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final ancho = frame.image.width;
+    final alto = frame.image.height;
+    frame.image.dispose();
+    codec.dispose();
+    final png =
+        bytes.length >= 8 &&
+        bytes[0] == 0x89 &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x4E &&
+        bytes[3] == 0x47;
+    final jpeg = bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+    if (!png && !jpeg) {
+      throw const FormatException(
+        'La evidencia debe estar en formato PNG o JPEG para incluirla en Word.',
+      );
+    }
+    final escala = math.min(5000 / ancho, 3500 / alto);
+    final hex = bytes
+        .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+        .join();
+    final hexEnLineas = RegExp('.{1,128}')
+        .allMatches(hex)
+        .map((m) => m[0])
+        .join('\n');
+    return '{\\pict\\${png ? 'png' : 'jpeg'}blip'
+        '\\picw$ancho\\pich$alto'
+        '\\picwgoal${(ancho * escala).round()}'
+        '\\pichgoal${(alto * escala).round()}\n$hexEnLineas}';
+  }
+
+  static String _escaparRtf(String value) {
+    final result = StringBuffer();
+    for (final codeUnit in value.codeUnits) {
+      if (codeUnit == 0x5C || codeUnit == 0x7B || codeUnit == 0x7D) {
+        result
+          ..write(r'\')
+          ..writeCharCode(codeUnit);
+      } else if (codeUnit == 0x0A || codeUnit == 0x0D) {
+        result.write(r'\line ');
+      } else if (codeUnit == 0x09) {
+        result.write(r'\tab ');
+      } else if (codeUnit > 0x7E) {
+        result.write(
+          '\\u${codeUnit > 0x7FFF ? codeUnit - 0x10000 : codeUnit}?',
+        );
+      } else {
+        result.writeCharCode(codeUnit);
+      }
+    }
+    return result.toString();
   }
 
   static String _xml(Object? value) => '${value ?? ''}'
@@ -2883,8 +3302,7 @@ class _ProyectosPageState extends State<ProyectosPage> {
           ),
           actions: [
             TextButton(
-              onPressed: () =>
-                  Navigator.of(dialogContext, rootNavigator: true).pop(),
+              onPressed: () => Navigator.of(dialogContext).pop(),
               child: const Text('Cancelar'),
             ),
             FilledButton(
@@ -3103,6 +3521,8 @@ class _RecorridosPageState extends State<RecorridosPage>
   bool _cargando = true;
   bool _iniciandoRecorrido = false;
   bool _registrandoMuestreo = false;
+  bool _cargandoGuardadoMuestreo = false;
+  bool _finalizandoRecorrido = false;
   bool _disposed = false;
   String? _error;
   Timer? _temporizadorCamara;
@@ -3286,7 +3706,9 @@ class _RecorridosPageState extends State<RecorridosPage>
     if (_iniciandoRecorrido || !mounted || _disposed) return;
     setState(() => _iniciandoRecorrido = true);
     try {
-      final nombre = await _pedirNombreRecorrido();
+      final tipo = await _pedirTipoRecorrido();
+      if (tipo == null || !mounted || _disposed) return;
+      final nombre = await _pedirNombreRecorrido(tipo);
       if (nombre == null || !mounted || _disposed) return;
       if (!await _prepararUbicacion()) return;
       if (!mounted || _disposed) return;
@@ -3300,6 +3722,7 @@ class _RecorridosPageState extends State<RecorridosPage>
       final id = await PuntosDatabase.crearRecorrido(
         proyectoId: widget.proyecto.id,
         nombre: nombre,
+        tipo: tipo,
       );
       final recorridos = await PuntosDatabase.obtenerRecorridos(
         widget.proyecto.id,
@@ -3341,31 +3764,57 @@ class _RecorridosPageState extends State<RecorridosPage>
 
     setState(() => _registrandoMuestreo = true);
     try {
-      final registro = await _pedirDatosMuestreo();
-      if (!mounted || _disposed || registro == null) return;
-
-      if (registro.racimosVerdes == null &&
-          registro.racimosPintones == null &&
-          registro.inflorescencias == null &&
-          registro.fotoPath == null) {
-        _mostrarAviso('Ingresa al menos un dato o adjunta una evidencia.');
-        return;
+      int? racimosVerdes;
+      int? racimosPintones;
+      int? inflorescencias;
+      String? fotoPath;
+      String? datosVisita;
+      if (recorrido.tipo == TipoRecorrido.visitaTecnica) {
+        final registro = await _pedirDatosVisitaTecnica();
+        if (!mounted || _disposed || registro == null) return;
+        datosVisita = jsonEncode(registro.datos);
+        fotoPath = registro.fotoPath;
+      } else {
+        final registro = await _pedirDatosMuestreo();
+        if (!mounted || _disposed || registro == null) return;
+        racimosVerdes = registro.racimosVerdes;
+        racimosPintones = registro.racimosPintones;
+        inflorescencias = registro.inflorescencias;
+        fotoPath = registro.fotoPath;
+        if (racimosVerdes == null &&
+            racimosPintones == null &&
+            inflorescencias == null &&
+            fotoPath == null) {
+          _mostrarAviso('Ingresa al menos un dato o adjunta una evidencia.');
+          return;
+        }
       }
 
+      if (!mounted || _disposed) return;
+      setState(() => _cargandoGuardadoMuestreo = true);
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || _disposed) return;
+      if (!await _prepararUbicacion()) return;
+      if (!mounted || _disposed) return;
       final posicion = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 30),
         ),
       );
       if (!mounted || _disposed) return;
 
+      if (fotoPath != null && recorrido.tipo == TipoRecorrido.visitaTecnica) {
+        fotoPath = await _guardarEvidenciaVisita(fotoPath);
+      }
       await PuntosDatabase.guardarRegistroRecorrido(
         recorridoId: recorrido.id,
         posicion: posicion,
-        racimosVerdes: registro.racimosVerdes,
-        racimosPintones: registro.racimosPintones,
-        inflorescencias: registro.inflorescencias,
-        fotoPath: registro.fotoPath,
+        racimosVerdes: racimosVerdes,
+        racimosPintones: racimosPintones,
+        inflorescencias: inflorescencias,
+        fotoPath: fotoPath,
+        datosVisita: datosVisita,
       );
       if (!mounted || _disposed) return;
 
@@ -3379,15 +3828,277 @@ class _RecorridosPageState extends State<RecorridosPage>
       if (!mounted || _disposed) return;
       setState(() {});
       _mostrarAviso('Registro guardado en la ubicación actual.');
+    } on TimeoutException {
+      if (mounted && !_disposed) {
+        _mostrarAviso(
+          'No se obtuvo la ubicación GPS a tiempo. Verifica la señal e intenta guardar de nuevo.',
+        );
+      }
     } catch (error) {
       if (mounted && !_disposed) {
         _mostrarAviso('No se pudo guardar el registro: $error');
       }
     } finally {
       if (mounted && !_disposed) {
-        setState(() => _registrandoMuestreo = false);
+        setState(() {
+          _registrandoMuestreo = false;
+          _cargandoGuardadoMuestreo = false;
+        });
       }
     }
+  }
+
+  Future<String> _guardarEvidenciaVisita(String sourcePath) async {
+    final extension = path.extension(sourcePath).toLowerCase();
+    if (!['.jpg', '.jpeg', '.png'].contains(extension)) {
+      throw const FormatException(
+        'Selecciona una imagen JPG o PNG para incluirla en el informe Word.',
+      );
+    }
+    final directory = Directory(
+      path.join(
+        (await getApplicationDocumentsDirectory()).path,
+        'evidencias_visita_tecnica',
+      ),
+    );
+    await directory.create(recursive: true);
+    final destination = File(
+      path.join(
+        directory.path,
+        'visita_${DateTime.now().microsecondsSinceEpoch}$extension',
+      ),
+    );
+    await File(sourcePath).copy(destination.path);
+    return destination.path;
+  }
+
+  Future<({Map<String, Object?> datos, String? fotoPath})?>
+  _pedirDatosVisitaTecnica() async {
+    if (!mounted || _disposed) return null;
+    final cantidades = {
+      for (final item in [
+        'Lepthopharsa',
+        'Demotispa',
+        'Cephaloleia',
+        'Opsiphanes',
+      ])
+        item: TextEditingController(),
+    };
+    final enfermedadesPresentes = <String>{};
+    final plagasPresentes = <String, bool>{};
+    String categoria = 'enfermedades';
+    String? fotoPath;
+    String? error;
+    final resultado =
+        await _mostrarDialogoConCierreCompleto<
+          ({Map<String, Object?> datos, String? fotoPath})
+        >(
+          (dialogContext) => StatefulBuilder(
+            builder: (dialogContext, setDialogState) => AlertDialog(
+              title: const Text('Visita técnica · nuevo registro'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(
+                          value: 'enfermedades',
+                          label: Text('Enfermedades'),
+                        ),
+                        ButtonSegment(value: 'plagas', label: Text('Plagas')),
+                      ],
+                      selected: {categoria},
+                      onSelectionChanged: (seleccion) {
+                        setDialogState(() => categoria = seleccion.first);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    if (categoria == 'enfermedades')
+                      for (final enfermedad in ['MS', 'AR', 'PE'])
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Column(
+                            children: [
+                              CheckboxListTile(
+                                contentPadding: EdgeInsets.zero,
+                                title: Text(enfermedad),
+                                subtitle: const Text('¿La presenta?'),
+                                value: enfermedadesPresentes.contains(
+                                  enfermedad,
+                                ),
+                                onChanged: (value) => setDialogState(() {
+                                  if (value ?? false) {
+                                    enfermedadesPresentes.add(enfermedad);
+                                  } else {
+                                    enfermedadesPresentes.remove(enfermedad);
+                                  }
+                                  error = null;
+                                }),
+                              ),
+                            ],
+                          ),
+                        )
+                    else
+                      for (final plaga in [
+                        'Lepthopharsa',
+                        'Demotispa',
+                        'Cephaloleia',
+                        'Opsiphanes',
+                      ])
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CheckboxListTile(
+                                contentPadding: EdgeInsets.zero,
+                                title: Text(plaga),
+                                subtitle: const Text('¿La presenta?'),
+                                value: plagasPresentes[plaga] ?? false,
+                                onChanged: (value) => setDialogState(() {
+                                  plagasPresentes[plaga] = value ?? false;
+                                  error = null;
+                                }),
+                              ),
+                              if (plagasPresentes[plaga] ?? false)
+                                TextFormField(
+                                  controller: cantidades[plaga],
+                                  keyboardType: TextInputType.number,
+                                  inputFormatters: [
+                                    FilteringTextInputFormatter.digitsOnly,
+                                  ],
+                                  onChanged: (_) {
+                                    if (error != null) {
+                                      setDialogState(() => error = null);
+                                    }
+                                  },
+                                  decoration: const InputDecoration(
+                                    labelText: 'Cantidad observada',
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        final source = await showModalBottomSheet<ImageSource>(
+                          context: dialogContext,
+                          builder: (sheetContext) => SafeArea(
+                            child: Wrap(
+                              children: [
+                                ListTile(
+                                  leading: const Icon(Icons.camera_alt),
+                                  title: const Text('Tomar foto'),
+                                  onTap: () =>
+                                      Navigator.of(sheetContext)
+                                          .pop(ImageSource.camera),
+                                ),
+                                ListTile(
+                                  leading: const Icon(Icons.photo_library),
+                                  title: const Text('Elegir de la galería'),
+                                  onTap: () =>
+                                      Navigator.of(sheetContext)
+                                          .pop(ImageSource.gallery),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                        if (source == null) return;
+                        try {
+                          final foto = await ImagePicker().pickImage(
+                            source: source,
+                            imageQuality: 85,
+                          );
+                          if (!dialogContext.mounted || foto == null) return;
+                          setDialogState(() {
+                            fotoPath = foto.path;
+                            error = null;
+                          });
+                        } catch (exception) {
+                          if (dialogContext.mounted) {
+                            setDialogState(
+                              () => error =
+                                  'No se pudo adjuntar la imagen: $exception',
+                            );
+                          }
+                        }
+                      },
+                      icon: const Icon(Icons.add_a_photo),
+                      label: Text(
+                        fotoPath == null ? 'Adjuntar imagen' : 'Cambiar imagen',
+                      ),
+                    ),
+                    if (fotoPath != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Image.file(
+                          File(fotoPath!),
+                          height: 140,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => const Text(
+                            'No se pudo previsualizar la imagen seleccionada.',
+                          ),
+                        ),
+                      ),
+                    if (error != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          error!,
+                          style: TextStyle(
+                            color: Theme.of(dialogContext).colorScheme.error,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancelar'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final datos = <String, Object?>{'categoria': categoria};
+                    if (categoria == 'enfermedades') {
+                      datos['enfermedades_presentes'] = enfermedadesPresentes
+                          .toList();
+                    } else {
+                      for (final plaga in [
+                        'Lepthopharsa',
+                        'Demotispa',
+                        'Cephaloleia',
+                        'Opsiphanes',
+                      ]) {
+                        final presente = plagasPresentes[plaga] ?? false;
+                        final textoCantidad = cantidades[plaga]!.text.trim();
+                        final cantidad = !presente || textoCantidad.isEmpty
+                            ? 0
+                            : int.tryParse(textoCantidad) ?? 0;
+                        datos[plaga] = {
+                          'presente': presente,
+                          'cantidad': cantidad,
+                        };
+                      }
+                    }
+                    Navigator.of(dialogContext)
+                        .pop((datos: datos, fotoPath: fotoPath));
+                  },
+                  child: const Text('Guardar registro'),
+                ),
+              ],
+            ),
+          ),
+        );
+    for (final controller in cantidades.values) {
+      controller.dispose();
+    }
+    return resultado;
   }
 
   Future<
@@ -3683,9 +4394,27 @@ class _RecorridosPageState extends State<RecorridosPage>
   }
 
   Future<void> _finalizar() async {
+    if (_finalizandoRecorrido || !mounted || _disposed) return;
+    final recorrido = _actual;
+    if (recorrido == null) return;
     try {
-      final recorrido = _actual;
-      if (recorrido == null) return;
+      String? recomendacion;
+      if (recorrido.tipo == TipoRecorrido.visitaTecnica) {
+        recomendacion = await _pedirRecomendacionFinal(
+          recorrido.recomendacionFinal,
+        );
+        if (recomendacion == null || !mounted || _disposed) return;
+      }
+      if (!mounted || _disposed) return;
+      setState(() => _finalizandoRecorrido = true);
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || _disposed) return;
+      if (recomendacion != null) {
+        await PuntosDatabase.guardarRecomendacionFinal(
+          recorrido.id,
+          recomendacion,
+        );
+      }
       final subscription = _suscripcion;
       _suscripcion = null;
       await subscription?.cancel();
@@ -3700,7 +4429,75 @@ class _RecorridosPageState extends State<RecorridosPage>
       await _cargarRecorridos();
     } catch (error) {
       if (mounted) _mostrarAviso('No se pudo finalizar el recorrido: $error');
+    } finally {
+      if (mounted && !_disposed) {
+        setState(() => _finalizandoRecorrido = false);
+      }
     }
+  }
+
+  Future<String?> _pedirRecomendacionFinal(String? actual) async {
+    if (!mounted || _disposed) return null;
+    final controller = TextEditingController(text: actual ?? '');
+    var error = false;
+    final resultado = await _mostrarDialogoConCierreCompleto<String>(
+      (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('Recomendación final'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            minLines: 3,
+            maxLines: 6,
+            decoration: InputDecoration(
+              labelText: 'Recomendación para la plantación *',
+              errorText: error
+                  ? 'Escribe una recomendación para finalizar.'
+                  : null,
+              border: const OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Continuar después'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final texto = controller.text.trim();
+                if (texto.isEmpty) {
+                  setDialogState(() => error = true);
+                  return;
+                }
+                Navigator.of(dialogContext).pop(texto);
+              },
+              child: const Text('Guardar y finalizar'),
+            ),
+          ],
+        ),
+      ),
+    );
+    controller.dispose();
+    return resultado;
+  }
+
+  Future<T?> _mostrarDialogoConCierreCompleto<T>(WidgetBuilder builder) async {
+    Future<dynamic>? rutaCompletada;
+    final resultado = await showDialog<T>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) {
+        rutaCompletada ??= ModalRoute.of(dialogContext)?.completed;
+        return builder(dialogContext);
+      },
+    );
+    final cierre = rutaCompletada;
+    if (cierre == null) {
+      throw StateError('No se pudo esperar el cierre completo del diálogo.');
+    }
+    await cierre;
+    await WidgetsBinding.instance.endOfFrame;
+    return resultado;
   }
 
   Future<void> _exportarRecorrido(
@@ -3719,7 +4516,49 @@ class _RecorridosPageState extends State<RecorridosPage>
     }
   }
 
-  Future<String?> _pedirNombreRecorrido() async {
+  Future<TipoRecorrido?> _pedirTipoRecorrido() async {
+    if (!mounted || _disposed) return null;
+    return showDialog<TipoRecorrido>(
+      context: context,
+      useRootNavigator: true,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Iniciar recorrido'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text('Selecciona el tipo de recorrido:'),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: () => Navigator.of(
+                dialogContext,
+                rootNavigator: true,
+              ).pop(TipoRecorrido.estimativo),
+              icon: const Icon(Icons.assessment_outlined),
+              label: const Text('Estimativo'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(
+                dialogContext,
+                rootNavigator: true,
+              ).pop(TipoRecorrido.visitaTecnica),
+              icon: const Icon(Icons.health_and_safety_outlined),
+              label: const Text('Visita técnica'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext, rootNavigator: true).pop(),
+            child: const Text('Cancelar'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<String?> _pedirNombreRecorrido(TipoRecorrido tipo) async {
     if (!mounted || _disposed) return null;
 
     var nombre = 'Recorrido ${_recorridos.length + 1}';
@@ -3727,7 +4566,11 @@ class _RecorridosPageState extends State<RecorridosPage>
       context: context,
       useRootNavigator: true,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Nuevo recorrido'),
+        title: Text(
+          tipo == TipoRecorrido.visitaTecnica
+              ? 'Nueva visita técnica'
+              : 'Nuevo recorrido estimativo',
+        ),
         content: TextFormField(
           initialValue: nombre,
           autofocus: true,
@@ -3813,7 +4656,7 @@ class _RecorridosPageState extends State<RecorridosPage>
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
-            tooltip: 'Nuevo recorrido',
+            tooltip: 'Iniciar recorrido',
             onPressed: _iniciandoRecorrido ? null : _iniciarRecorrido,
             icon: const Icon(Icons.add_road),
           ),
@@ -3890,21 +4733,6 @@ class _RecorridosPageState extends State<RecorridosPage>
                             ),
                           ],
                         ),
-                      if (_coordenadaSeleccionada != null)
-                        MarkerLayer(
-                          markers: [
-                            Marker(
-                              point: _coordenadaSeleccionada!,
-                              width: 42,
-                              height: 42,
-                              child: const Icon(
-                                Icons.add_location_alt,
-                                color: Colors.red,
-                                size: 36,
-                              ),
-                            ),
-                          ],
-                        ),
                       MarkerLayer(
                         markers: _puntosMuestreo.map((punto) {
                           final latitud = (punto['latitud']! as num).toDouble();
@@ -3915,6 +4743,41 @@ class _RecorridosPageState extends State<RecorridosPage>
                           final inflorescencias = punto['inflorescencias'];
                           final tieneFoto = punto['foto_path'] != null;
                           final numero = punto['numero_registro'] as int?;
+                          final datosVisita = _datosVisitaParaMarcador(
+                            punto['datos_visita'],
+                          );
+                          final detallesVisita = <String>[];
+                          if (datosVisita['categoria'] == 'enfermedades') {
+                            for (final enfermedad in ['MS', 'AR', 'PE']) {
+                              if (_enfermedadPresente(
+                                datosVisita,
+                                enfermedad,
+                              )) {
+                                detallesVisita.add('$enfermedad: Sí presenta');
+                              }
+                            }
+                            if (detallesVisita.isEmpty) {
+                              detallesVisita.add('Sin enfermedades presentes');
+                            }
+                          } else if (datosVisita['categoria'] == 'plagas') {
+                            for (final plaga in [
+                              'Lepthopharsa',
+                              'Demotispa',
+                              'Cephaloleia',
+                              'Opsiphanes',
+                            ]) {
+                              final datosPlaga = datosVisita[plaga];
+                              if (datosPlaga is Map &&
+                                  datosPlaga['presente'] == true) {
+                                detallesVisita.add(
+                                  '$plaga: ${datosPlaga['cantidad']}',
+                                );
+                              }
+                            }
+                            if (detallesVisita.isEmpty) {
+                              detallesVisita.add('Sin plagas presentes');
+                            }
+                          }
                           return Marker(
                             point: LatLng(latitud, longitud),
                             width: 32,
@@ -3922,6 +4785,11 @@ class _RecorridosPageState extends State<RecorridosPage>
                             child: Tooltip(
                               message: [
                                 'Punto de registro',
+                                if (datosVisita['categoria'] != null)
+                                  datosVisita['categoria'] == 'plagas'
+                                      ? 'Plagas'
+                                      : 'Enfermedades',
+                                ...detallesVisita,
                                 if (verdes != null) 'Verdes: $verdes',
                                 if (pintones != null) 'Pintones: $pintones',
                                 if (inflorescencias != null)
@@ -4062,9 +4930,7 @@ class _RecorridosPageState extends State<RecorridosPage>
                                             ),
                                           ),
                                           label: Text(
-                                            recorridoItem.nombre.isNotEmpty
-                                                ? recorridoItem.nombre
-                                                : 'Recorrido ${recorridoItem.id}',
+                                            '${recorridoItem.tipo == TipoRecorrido.visitaTecnica ? 'Visita técnica' : 'Estimativo'} · ${recorridoItem.nombre.isNotEmpty ? recorridoItem.nombre : 'Recorrido ${recorridoItem.id}'}',
                                           ),
                                           selected: seleccionado,
                                           selectedColor: _colorEstadoRecorrido(
@@ -4096,6 +4962,15 @@ class _RecorridosPageState extends State<RecorridosPage>
                                         style: Theme.of(context)
                                             .textTheme
                                             .titleLarge,
+                                      ),
+                                      Text(
+                                        recorrido.tipo ==
+                                                TipoRecorrido.visitaTecnica
+                                            ? 'Visita técnica'
+                                            : 'Recorrido estimativo',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall,
                                       ),
                                       Row(
                                         children: [
@@ -4135,6 +5010,17 @@ class _RecorridosPageState extends State<RecorridosPage>
                                       Text(
                                         'Registros de plantación: $_registrosMuestreo',
                                       ),
+                                      if (recorrido.tipo ==
+                                              TipoRecorrido.visitaTecnica &&
+                                          recorrido.recomendacionFinal != null)
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            top: 8,
+                                          ),
+                                          child: Text(
+                                            'Recomendación final: ${recorrido.recomendacionFinal}',
+                                          ),
+                                        ),
                                       const SizedBox(height: 8),
                                       if (recorrido.estado ==
                                               EstadoRecorrido.activo ||
@@ -4156,9 +5042,19 @@ class _RecorridosPageState extends State<RecorridosPage>
                                                 onPressed: _registrandoMuestreo
                                                     ? null
                                                     : _registrarMuestreo,
-                                                icon: const Icon(Icons.forest),
-                                                label: const Text(
-                                                  'Registrar punto',
+                                                icon: Icon(
+                                                  recorrido.tipo ==
+                                                          TipoRecorrido
+                                                              .visitaTecnica
+                                                      ? Icons.health_and_safety
+                                                      : Icons.forest,
+                                                ),
+                                                label: Text(
+                                                  recorrido.tipo ==
+                                                          TipoRecorrido
+                                                              .visitaTecnica
+                                                      ? 'Registrar enfermedad o plaga'
+                                                      : 'Registrar punto',
                                                 ),
                                               ),
                                             if (recorrido.estado ==
@@ -4220,6 +5116,21 @@ class _RecorridosPageState extends State<RecorridosPage>
                                           OutlinedButton.icon(
                                             onPressed: () => _exportarRecorrido(
                                               () =>
+                                                  ExportadorDatos.compartirRecorridoWord(
+                                                    recorrido.id,
+                                                  ),
+                                              'el informe Word con evidencias',
+                                            ),
+                                            icon: const Icon(
+                                              Icons.description_outlined,
+                                            ),
+                                            label: const Text(
+                                              'Informe Word con fotos',
+                                            ),
+                                          ),
+                                          OutlinedButton.icon(
+                                            onPressed: () => _exportarRecorrido(
+                                              () =>
                                                   ExportadorDatos.compartirRecorridoKml(
                                                     recorrido.id,
                                                   ),
@@ -4253,8 +5164,14 @@ class _RecorridosPageState extends State<RecorridosPage>
                     ),
                   ),
                 ),
-                if (_iniciandoRecorrido || _registrandoMuestreo)
-                  const _CargandoOperacion(mensaje: 'Guardando información...'),
+                if (_finalizandoRecorrido)
+                  const _CargandoOperacion(mensaje: 'Finalizando recorrido...')
+                else if (_iniciandoRecorrido)
+                  const _CargandoOperacion(mensaje: 'Iniciando recorrido...')
+                else if (_cargandoGuardadoMuestreo)
+                  const _CargandoOperacion(
+                    mensaje: 'Obteniendo ubicación y guardando registro...',
+                  ),
               ],
             ),
     );

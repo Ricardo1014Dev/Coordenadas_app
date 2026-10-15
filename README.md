@@ -32,6 +32,21 @@ del servicio **Esri World Cities**.
 Consulta los términos de Esri para los usos y la redistribución de la
 cartografía.
 
+## Visitas técnicas
+
+Al iniciar un recorrido dentro de una plantación se puede elegir entre el
+recorrido estimativo existente y una visita técnica. En cada registro técnico
+se alterna entre enfermedades (selección múltiple de MS, AR y PE para indicar
+presencia, sin cantidades) y plagas (presencia y cantidad de Lepthopharsa,
+Demotispa, Cephaloleia y Opsiphanes).
+Los registros guardan la ubicación GPS y pueden incluir una foto. Al finalizar
+la visita se solicita una recomendación final.
+
+Los registros se exportan a Excel o a un informe RTF compatible con Word que
+incluye las fotos. El KML conserva la estructura de ruta y puntos de los
+recorridos estimativos; agrega los datos de visita técnica como atributos
+`ExtendedData` de cada punto, para poder consultarlos como campos en QGIS.
+
 ## Ejecutar
 
 ```sh
