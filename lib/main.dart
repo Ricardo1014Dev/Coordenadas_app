@@ -630,6 +630,9 @@ class _InicioRecorridosPageState extends State<InicioRecorridosPage> {
       }
       final posicion = await Geolocator.getCurrentPosition();
       if (!mounted || _disposed) return;
+      if (!PuntosDatabase.esPuntoValido(posicion)) {
+        throw Exception('La ubicación actual no es válida.');
+      }
       setState(() => _posicion = posicion);
       _moverMapa(LatLng(posicion.latitude, posicion.longitude), 17);
       _suscribirseUbicacion();
@@ -1489,6 +1492,7 @@ class Proyecto {
     this.longitud,
     this.variedadPalma,
     this.cantidadPalmas,
+    this.hectareaje,
     this.fechaInicio,
     this.fechaFin,
     this.fotoPath,
@@ -1503,6 +1507,7 @@ class Proyecto {
   final double? longitud;
   final String? variedadPalma;
   final int? cantidadPalmas;
+  final double? hectareaje;
   final String? fechaInicio;
   final String? fechaFin;
   final String? fotoPath;
@@ -1545,7 +1550,7 @@ class PuntosDatabase {
     final databasePath = path.join(databasesPath, 'coordenadas.db');
     _database = await openDatabase(
       databasePath,
-      version: 14,
+      version: 15,
       onCreate: (database, version) async {
         await database.execute('''
           CREATE TABLE puntos (
@@ -1626,6 +1631,11 @@ class PuntosDatabase {
             'ALTER TABLE recorrido_puntos ADD COLUMN datos_visita TEXT',
           );
         }
+        if (oldVersion < 15) {
+          await database.execute(
+            'ALTER TABLE proyectos ADD COLUMN hectareaje REAL',
+          );
+        }
       },
     );
     return _database!;
@@ -1685,7 +1695,8 @@ class PuntosDatabase {
         fecha_fin TEXT,
         foto_path TEXT,
         variedad_palma TEXT,
-        cantidad_palmas INTEGER
+        cantidad_palmas INTEGER,
+        hectareaje REAL
       )
     ''');
   }
@@ -1710,6 +1721,9 @@ class PuntosDatabase {
     );
     await database.execute(
       'ALTER TABLE proyectos ADD COLUMN cantidad_palmas INTEGER',
+    );
+    await database.execute(
+      'ALTER TABLE proyectos ADD COLUMN hectareaje REAL',
     );
   }
 
@@ -1738,6 +1752,7 @@ class PuntosDatabase {
             longitud: (row['longitud'] as num?)?.toDouble(),
             variedadPalma: row['variedad_palma'] as String?,
             cantidadPalmas: row['cantidad_palmas'] as int?,
+            hectareaje: (row['hectareaje'] as num?)?.toDouble(),
             fechaInicio: row['fecha_inicio'] as String?,
             fechaFin: row['fecha_fin'] as String?,
             fotoPath: row['foto_path'] as String?,
@@ -1755,6 +1770,7 @@ class PuntosDatabase {
     double? longitud,
     String? variedadPalma,
     int? cantidadPalmas,
+    double? hectareaje,
     String? fechaInicio,
     String? fechaFin,
     String? fotoPath,
@@ -1769,6 +1785,7 @@ class PuntosDatabase {
       'longitud': longitud,
       'variedad_palma': variedadPalma,
       'cantidad_palmas': cantidadPalmas,
+      'hectareaje': hectareaje,
       'fecha_inicio': fechaInicio,
       'fecha_fin': fechaFin,
       'foto_path': fotoPath,
@@ -1778,12 +1795,19 @@ class PuntosDatabase {
   static Future<void> actualizarDatosPlantacion({
     required int id,
     required String nombre,
-    required int cantidadPalmas,
+    String? responsable,
+    int? cantidadPalmas,
+    double? hectareaje,
   }) async {
     final database = await PuntosDatabase.database;
     await database.update(
       'proyectos',
-      {'nombre': nombre, 'cantidad_palmas': cantidadPalmas},
+      {
+        'nombre': nombre,
+        'responsable': responsable,
+        'cantidad_palmas': cantidadPalmas,
+        'hectareaje': hectareaje,
+      },
       where: 'id = ?',
       whereArgs: [id],
     );
@@ -1951,10 +1975,49 @@ class PuntosDatabase {
     );
   }
 
+  static bool esPuntoValido(Position posicion, {Position? ultimoPunto}) {
+    final latitud = posicion.latitude;
+    final longitud = posicion.longitude;
+
+    if (latitud.isNaN ||
+        longitud.isNaN ||
+        latitud.abs() > 90 ||
+        longitud.abs() > 180 ||
+        (latitud == 0.0 && longitud == 0.0)) {
+      return false;
+    }
+
+    if (posicion.accuracy <= 0 || posicion.accuracy > 25) {
+      return false;
+    }
+
+    if (ultimoPunto != null) {
+      final diferencia = posicion.timestamp.difference(ultimoPunto.timestamp);
+      if (!diferencia.isNegative && diferencia.inSeconds > 0) {
+        final distanciaMetros = Geolocator.distanceBetween(
+          ultimoPunto.latitude,
+          ultimoPunto.longitude,
+          latitud,
+          longitud,
+        );
+        final velocidadMps = distanciaMetros / diferencia.inSeconds;
+        if (distanciaMetros > 200 && velocidadMps > 30) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
   static Future<void> guardarPuntoRecorrido({
     required int recorridoId,
     required Position posicion,
+    Position? ultimoPunto,
   }) async {
+    if (!esPuntoValido(posicion, ultimoPunto: ultimoPunto)) {
+      return;
+    }
     final database = await PuntosDatabase.database;
     await database.insert('recorrido_puntos', {
       'recorrido_id': recorridoId,
@@ -1971,6 +2034,9 @@ class PuntosDatabase {
     required int recorridoId,
     required Position posicion,
   }) async {
+    if (!esPuntoValido(posicion)) {
+      return;
+    }
     final database = await PuntosDatabase.database;
     await database.transaction((transaction) async {
       final puntoId = await transaction.insert('recorrido_puntos', {
@@ -2002,12 +2068,16 @@ class PuntosDatabase {
   static Future<void> guardarRegistroRecorrido({
     required int recorridoId,
     required Position posicion,
+    Position? ultimoPunto,
     int? racimosVerdes,
     int? racimosPintones,
     int? inflorescencias,
     String? fotoPath,
     String? datosVisita,
   }) async {
+    if (!esPuntoValido(posicion, ultimoPunto: ultimoPunto)) {
+      return;
+    }
     final database = await PuntosDatabase.database;
     final ultimoRegistro = await database.rawQuery(
       'SELECT COALESCE(MAX(numero_registro), 0) AS numero '
@@ -2039,14 +2109,27 @@ class PuntosDatabase {
       whereArgs: [id],
       orderBy: 'fecha',
     );
-    return filas
-        .map(
-          (fila) => LatLng(
-            (fila['latitud']! as num).toDouble(),
-            (fila['longitud']! as num).toDouble(),
-          ),
-        )
-        .toList();
+    final puntos = <LatLng>[];
+    for (final fila in filas) {
+      final latitud = (fila['latitud'] as num?)?.toDouble();
+      final longitud = (fila['longitud'] as num?)?.toDouble();
+      if (latitud == null || longitud == null) continue;
+      if ((latitud == 0.0 && longitud == 0.0) ||
+          latitud.isNaN ||
+          longitud.isNaN ||
+          latitud.abs() > 90 ||
+          longitud.abs() > 180) {
+        continue;
+      }
+      final ultimo = puntos.isNotEmpty ? puntos.last : null;
+      if (ultimo != null &&
+          ultimo.latitude == latitud &&
+          ultimo.longitude == longitud) {
+        continue;
+      }
+      puntos.add(LatLng(latitud, longitud));
+    }
+    return puntos;
   }
 
   static Future<int> contarRegistrosRecorrido(int id) async {
@@ -2302,7 +2385,8 @@ class TransferenciaPlantacion {
           'foto_path': proyectoFoto,
           'variedad_palma': proyectoOrigen['variedad_palma'],
           'cantidad_palmas': proyectoOrigen['cantidad_palmas'],
-        });
+            'hectareaje': proyectoOrigen['hectareaje'],
+          });
         for (final grupo in recorridosPreparados) {
           final estadoOrigen = grupo.datos['estado'] as String;
           final estadoImportado =
@@ -3094,8 +3178,10 @@ class _ProyectosPageState extends State<ProyectosPage> {
       await PuntosDatabase.guardarProyecto(
         nombre: datos.nombre,
         descripcion: '',
+        responsable: datos.responsable,
         estado: 'Planificado',
         cantidadPalmas: datos.cantidadPalmas,
+        hectareaje: datos.hectareaje,
       );
       await _cargarProyectos();
     } catch (error) {
@@ -3129,7 +3215,9 @@ class _ProyectosPageState extends State<ProyectosPage> {
         await PuntosDatabase.actualizarDatosPlantacion(
           id: proyecto.id,
           nombre: datos.nombre,
+          responsable: datos.responsable,
           cantidadPalmas: datos.cantidadPalmas,
+          hectareaje: datos.hectareaje,
         );
         await _cargarProyectos();
       } catch (error) {
@@ -3259,13 +3347,15 @@ class _ProyectosPageState extends State<ProyectosPage> {
     }
   }
 
-  Future<({String nombre, int cantidadPalmas})?> _pedirDatosProyecto({
+  Future<({String nombre, String? responsable, int? cantidadPalmas, double? hectareaje})?> _pedirDatosProyecto({
     Proyecto? proyecto,
   }) async {
     if (!mounted) return null;
     var nombre = proyecto?.nombre ?? '';
+    var responsable = proyecto?.responsable ?? '';
     var cantidadTexto = proyecto?.cantidadPalmas?.toString() ?? '';
-    return showDialog<({String nombre, int cantidadPalmas})>(
+    var hectareajeTexto = proyecto?.hectareaje?.toString() ?? '';
+    return showDialog<({String nombre, String? responsable, int? cantidadPalmas, double? hectareaje})>(
       context: context,
       useRootNavigator: true,
       builder: (dialogContext) => StatefulBuilder(
@@ -3284,16 +3374,38 @@ class _ProyectosPageState extends State<ProyectosPage> {
                     initialValue: nombre,
                     onChanged: (value) => nombre = value,
                     decoration: const InputDecoration(
-                      labelText: 'Nombre *',
+                      labelText: 'FINCA *',
                       hintText: 'Ej. Hacienda La Esperanza',
                     ),
                   ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    initialValue: responsable,
+                    onChanged: (value) => responsable = value,
+                    decoration: const InputDecoration(
+                      labelText: 'Nombre Palmicultor',
+                      hintText: 'Ej. Carlos Gómez',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
                   TextFormField(
                     initialValue: cantidadTexto,
                     keyboardType: TextInputType.number,
                     onChanged: (value) => cantidadTexto = value,
                     decoration: const InputDecoration(
-                      labelText: 'Cantidad de palmas *',
+                      labelText: 'Cantidad de palmas (opcional)',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    initialValue: hectareajeTexto,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    onChanged: (value) => hectareajeTexto = value,
+                    decoration: const InputDecoration(
+                      labelText: 'Hectareaje (opcional)',
+                      hintText: 'Ej. 12.5',
                     ),
                   ),
                 ],
@@ -3311,14 +3423,29 @@ class _ProyectosPageState extends State<ProyectosPage> {
                 if (nombreFinal.isEmpty) {
                   return;
                 }
-                final cantidad = int.tryParse(cantidadTexto.trim());
-                if (cantidad == null || cantidad < 0) {
+                final cantidad = cantidadTexto.trim().isEmpty
+                    ? null
+                    : int.tryParse(cantidadTexto.trim());
+                if (cantidad != null && cantidad < 0) {
+                  return;
+                }
+                final hectareaje = hectareajeTexto.trim().isEmpty
+                    ? null
+                    : double.tryParse(hectareajeTexto.trim());
+                if (hectareaje != null && hectareaje < 0) {
                   return;
                 }
                 Navigator.of(
                   dialogContext,
                   rootNavigator: true,
-                ).pop((nombre: nombreFinal, cantidadPalmas: cantidad));
+                ).pop((
+                  nombre: nombreFinal,
+                  responsable: responsable.trim().isEmpty
+                      ? null
+                      : responsable.trim(),
+                  cantidadPalmas: cantidad,
+                  hectareaje: hectareaje,
+                ));
               },
               child: const Text('Guardar'),
             ),
@@ -3372,8 +3499,13 @@ class _ProyectosPageState extends State<ProyectosPage> {
                     title: Text(proyecto.nombre),
                     subtitle: Text(
                       [
+                        if (proyecto.responsable != null &&
+                            proyecto.responsable!.isNotEmpty)
+                          'Palmicultor: ${proyecto.responsable}',
                         if (proyecto.cantidadPalmas != null)
                           'Palmas: ${proyecto.cantidadPalmas}',
+                        if (proyecto.hectareaje != null)
+                          'Hectáreas: ${proyecto.hectareaje}',
                         if (proyecto.latitud != null &&
                             proyecto.longitud != null)
                           'Ubicación generada',
@@ -3719,6 +3851,9 @@ class _RecorridosPageState extends State<RecorridosPage>
         ),
       );
       if (!mounted || _disposed) return;
+      if (!PuntosDatabase.esPuntoValido(posicionInicial)) {
+        throw Exception('La ubicación inicial del recorrido no es válida.');
+      }
       final id = await PuntosDatabase.crearRecorrido(
         proyectoId: widget.proyecto.id,
         nombre: nombre,
@@ -3803,6 +3938,11 @@ class _RecorridosPageState extends State<RecorridosPage>
         ),
       );
       if (!mounted || _disposed) return;
+      final ultimoPunto = _ultimaPosicion;
+      if (!PuntosDatabase.esPuntoValido(posicion, ultimoPunto: ultimoPunto)) {
+        throw Exception('La ubicación del registro no es válida.');
+      }
+      _ultimaPosicion = posicion;
 
       if (fotoPath != null && recorrido.tipo == TipoRecorrido.visitaTecnica) {
         fotoPath = await _guardarEvidenciaVisita(fotoPath);
@@ -3810,6 +3950,7 @@ class _RecorridosPageState extends State<RecorridosPage>
       await PuntosDatabase.guardarRegistroRecorrido(
         recorridoId: recorrido.id,
         posicion: posicion,
+        ultimoPunto: ultimoPunto,
         racimosVerdes: racimosVerdes,
         racimosPintones: racimosPintones,
         inflorescencias: inflorescencias,
@@ -4205,6 +4346,10 @@ class _RecorridosPageState extends State<RecorridosPage>
             distanceFilter: 5,
           ),
         ).listen((posicion) async {
+          final ultimoPunto = _ultimaPosicion;
+          if (!PuntosDatabase.esPuntoValido(posicion, ultimoPunto: ultimoPunto)) {
+            return;
+          }
           _ultimaPosicion = posicion;
           final recorrido = _actual;
           if (!mounted ||
@@ -4218,6 +4363,7 @@ class _RecorridosPageState extends State<RecorridosPage>
             await PuntosDatabase.guardarPuntoRecorrido(
               recorridoId: recorrido.id,
               posicion: posicion,
+              ultimoPunto: ultimoPunto,
             );
             if (!mounted || _disposed) return;
             final punto = LatLng(posicion.latitude, posicion.longitude);
